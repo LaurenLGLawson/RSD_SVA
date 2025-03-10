@@ -1,0 +1,313 @@
+---
+title: "Uncertainty analysis - SVA HMB"
+author: "Lauren Lawson"
+date: "2025-03-10"
+output: html_document
+---
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(scales)
+library(ggpattern)
+```
+
+
+#new main
+```{r}
+#Define salt application rates, the first four are parking application rates, the last two are road application rates. Parking is in g/m2 and roads are in kg/lane-length-km
+salt_rates_list <- c(rep(list(seq(27, 90, by = 10)), 4), 
+                     rep(list(seq(88, 130, by = 10)), 2))
+
+#Generate all possible assignments of salt rates across land use categories
+salt_combinations <- expand.grid(salt_rates_list)
+
+#Rename columns to match land use categories
+colnames(salt_combinations) <- c("Commercial", "Industrial", "Institutional", "Residential", 
+                                  "Road - Local", "Road - Arterial/Collector")
+
+#Define the function to apply to each watershed
+process_watershed <- function(watershed_df) {
+  #Extract the land use amounts for this watershed (all columns except 'Watershed' since it is a character)
+  land_use_values <- watershed_df %>% select(-Watershed) %>% unlist()  #Convert to numeric vector
+  
+  #Multiply each land use category's area by the assigned salt rate
+  salt_application <- as.data.frame(sweep(salt_combinations, 2, land_use_values, `*`))
+  
+  # Divide by 1000 for the first four categories of application rates, these were in grams not kg before division (Commercial, Industrial, Institutional, Residential) now they are in kg
+  salt_application[, 1:4] <- salt_application[, 1:4]/1000
+  
+  # Calculate total salt applied for each combination for the individual watersheds
+  salt_application$"Total Salt" <- rowSums(salt_application)
+  
+  # Return the result for the current watershed
+  return(salt_application)
+}
+
+# Loop through each watershed and apply the function
+watershed_results <- cumulative_land_amounts_bothcategories %>%
+  split(.$Watershed) %>%
+  map(process_watershed)
+
+#watershed_results is now a list where each item corresponds to the results for a different watershed for a different combination of application rates
+
+#Now add a new column to each data frame in the list with the watershed name, the watershed was the name of the list item so assign that name as a new column within each list item
+watershed_results <- map2(watershed_results, names(watershed_results), 
+                          ~ mutate(.x, Watershed = .y))
+
+#bind rows together from all lists so only have one global dataframe
+all_watersheds_df_uncertainty <- bind_rows(watershed_results)
+
+```
+
+#check number of rows
+
+```{r}
+#pivot to long format so can plot more easily using facet etc..
+long_all_watersheds_df_uncertainty <- pivot_longer(all_watersheds_df_uncertainty, 
+                          cols = -Watershed,  # Exclude the Watershed column from pivoting
+                          names_to = "Land_Use_Category", 
+                          values_to = "Salt_Applied")
+
+#add in the watershed areas as a new column to the dataframe
+long_all_watersheds_df_uncertainty  <- long_all_watersheds_df_uncertainty %>% 
+  mutate(Watershed.Area.km2 = case_when(Watershed == "1" ~ 31.04654,
+                                           Watershed == "2" ~ 139.4358,
+                                           Watershed == "3" ~ 77.95373,
+                                           Watershed == "4" ~ 61.14853,
+                                           Watershed == "5" ~ 46.7173, 
+                                           Watershed == "6" ~ 26.64799,
+                                           Watershed == "7" ~ 14.80912,
+                                           Watershed == "8" ~ 9.659133,
+                                           Watershed == "9" ~ 53.30076,
+                                           Watershed == "10" ~ 7.836384, 
+                                           Watershed == "11" ~ 34.54775,
+                                           Watershed == "12" ~ 16.68018,
+                                        ))
+
+#select for just watershed 1 and watershed 2 to plot
+W1and2_cumulative <- long_all_watersheds_df_uncertainty %>% 
+  filter(Watershed %in% c("1", "2"))
+
+#Setting colors to match the map colors for land-use classes
+custom_colors <- c("Commercial" = "hotpink", 
+                   "Industrial" = "darkred", 
+                   "Institutional" = "yellow", 
+                   "Residential" = "black", 
+                   "Road - Arterial/Collector" = "orange", 
+                   "Road - Local" = "darkgreen",
+                   "Total Salt" = "darkgray")
+```
+
+#summary data for each watershed
+```{r}
+#summarize the data by watershed and land-use category 
+summary_all_W <- long_all_watersheds_df_uncertainty %>% 
+  group_by(Watershed, Land_Use_Category) %>% 
+  summarise(
+    Min = min(Salt_Applied, na.rm = TRUE),
+    Q1 = quantile(Salt_Applied, 0.25, na.rm = TRUE),
+    Median = median(Salt_Applied, na.rm = TRUE),
+    Mean = mean(Salt_Applied, na.rm = TRUE),
+    Q3 = quantile(Salt_Applied, 0.75, na.rm = TRUE),
+    Max = max(Salt_Applied, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summary_all_W$Watershed <- as.numeric(summary_all_W$Watershed)
+
+arranged_summary_all_W <- summary_all_W %>% 
+  arrange(Watershed, desc(Median))
+
+#For the median cases, calculate the percentage of total salt it represents
+summary_all_W_ratios <- arranged_summary_all_W %>% 
+  group_by(Watershed) %>% 
+  mutate(
+    Total_Salt_Median = Median[Land_Use_Category == "Total Salt"],
+    Median_Ratio = Median / Total_Salt_Median,
+    Percent = round(Median_Ratio*100, 2)
+  ) %>% 
+  arrange(Watershed, desc(Median))
+
+#rank the median categories and show percentage
+ranked_summary <- summary_all_W_ratios %>%
+  filter(Land_Use_Category != "Total Salt") %>%  # Remove "Total Salt"
+  group_by(Watershed) %>%
+  arrange(Watershed, desc(Percent)) %>%
+  mutate(Rank = case_when(
+    row_number() == 1 ~ "First",
+    row_number() == 2 ~ "Second",
+    row_number() == 3 ~ "Third",
+    row_number() == 4 ~ "Fourth",
+    row_number() == 5 ~ "Fifth",
+    row_number() == 6 ~ "Sixth",
+    TRUE ~ paste0("Rank ", row_number())  # For any ranks beyond 3
+  )) %>%
+  ungroup() %>%
+  mutate(Land_Use_Info = paste0(Land_Use_Category, " (", Percent, "%)")) %>%
+  select(Watershed, Rank, Land_Use_Info) %>%
+  pivot_wider(names_from = Rank, values_from = Land_Use_Info)
+
+
+#view the ranked summaries for the median case
+ranked_summary 
+```
+
+
+
+#boxplots of each 
+#W1 and W2
+```{r}
+#plot w1 and w2 as a facet wrapped boxplot, convert the y axis to tonnes for visual purposes
+ggplot(W1and2_cumulative, aes(x = Land_Use_Category, y = Salt_Applied/1000, fill = Land_Use_Category)) +
+   geom_rect(data = W1and2_cumulative %>% group_by(Watershed) %>% 
+              summarise(min_y = min(Salt_Applied), max_y = max(Salt_Applied)),
+            aes(xmin = 4.5, xmax = 6.5, ymin = -Inf, ymax = Inf), 
+            fill = "peachpuff2", alpha = 0.5, inherit.aes = FALSE) +
+  geom_rect(data = W1and2_cumulative %>% group_by(Watershed) %>% 
+              summarise(min_y = min(Salt_Applied), max_y = max(Salt_Applied)),
+            aes(xmin = 0, xmax = 4.5, ymin = -Inf, ymax = Inf), 
+            fill = "skyblue", alpha = 0.4, inherit.aes = FALSE) +
+  geom_boxplot() +
+  facet_wrap(~ Watershed, ncol = 2,
+              scales = "free_y",
+             labeller = as_labeller(function(x) paste("Watershed", x)))+
+  theme_bw() +
+  scale_fill_manual(values = custom_colors) +
+  geom_vline(xintercept = 6.5, linetype = "dashed", color = "black") +
+  #geom_vline(xintercept = 4.5, linetype = "dashed", color = "black") +
+  theme(aspect.ratio = 1, # Make into a box
+        panel.spacing.x = unit(1, "cm")) + #add spacing between boxes
+  scale_x_discrete(labels = c(
+    "Commercial" = "Commercial",
+    "Industrial" = "Industrial",
+    "Institutional" = "Institutional",
+    "Residential" = "Residential",
+    "Road - Arterial/Collector" = "Arterial/Collector",
+    "Road - Local" = "Local",
+    "Total Salt" = "Total Salt"
+  )) +
+  labs(x = "Land-use class", y = "Salt applied per event (tonnes)") +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 14),  # Rotate x axis labels and increase size
+    axis.text.y = element_text(hjust = 1, size = 14),  # Rotate x axis labels and increase size
+    axis.title.y = element_text(margin = margin(r = 20), size = 16),  # Increase space between y-axis and label
+    axis.title.x = element_text(margin = margin(t = 20), size = 16),  # Increase space between y-axis and label
+
+      strip.text = element_text(size = 16)) +
+  #scale_y_continuous(labels = comma_format()) +  # Format y-axis with commas
+  guides(fill = "none")
+```
+
+##W3 to W12
+```{r}
+#plot w3 to w12 as a facet wrapped boxplot, convert the y axis to tonnes for visual purposes
+
+W3_to_12_cumulative <- long_all_watersheds_df_uncertainty %>% 
+  filter(Watershed %in% c("3", "4", "5", "6", "7", "8", "9", "10", "11", "12"))
+
+desired_order_3_12 <- c("3", "4", "5", "6", "7", "8", "9", "10", "11", "12")
+
+# Convert Watershed column to a factor with the specified levels
+W3_to_12_cumulative$Watershed <- factor(W3_to_12_cumulative$Watershed, levels = desired_order_3_12)
+
+#plot w3 to w12 as a facet wrapped boxplot, convert the y axis to tonnes for visual purposes
+#free y scale
+ggplot(W3_to_12_cumulative, aes(x = Land_Use_Category, y = Salt_Applied/1000, fill = Land_Use_Category)) +
+  geom_rect(data = W3_to_12_cumulative %>% group_by(Watershed) %>% 
+              summarise(min_y = min(Salt_Applied), max_y = max(Salt_Applied)),
+            aes(xmin = 4.5, xmax = 6.5, ymin = -Inf, ymax = Inf), 
+            fill = "peachpuff2", alpha = 0.7, inherit.aes = FALSE) +
+  geom_rect(data = W3_to_12_cumulative %>% group_by(Watershed) %>% 
+              summarise(min_y = min(Salt_Applied), max_y = max(Salt_Applied)),
+            aes(xmin = 0, xmax = 4.5, ymin = -Inf, ymax = Inf), 
+            fill = "skyblue", alpha = 0.4, inherit.aes = FALSE) +
+  geom_boxplot() +  # Adjust box position
+  facet_wrap(~ Watershed, ncol = 4, 
+              scales = "free_y",
+             labeller = as_labeller(function(x) paste("Watershed", x))) + 
+  theme_bw() +
+  labs(x = "Land-use class", y = "Salt applied per event (tonnes)") +
+  scale_fill_manual(values = custom_colors) +
+  geom_vline(xintercept = 6.5, linetype = "dashed", color = "black") +
+  theme(aspect.ratio = 1, # Make into a box
+        panel.spacing.x = unit(.5, "cm")) + #add spacing between boxes  labs(x = "Land-use class", y = "Salt applied per event (tonnes)") +
+    scale_x_discrete(labels = c(
+    "Commercial" = "Commercial",
+    "Industrial" = "Industrial",
+    "Institutional" = "Institutional",
+    "Residential" = "Residential",
+    "Road - Arterial/Collector" = "Arterial/Collector",
+    "Road - Local" = "Local",
+    "Total Salt" = "Total Salt"
+  )) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1, vjust = 1, size = 14),  # Rotate x axis labels and increase size
+    axis.text.y = element_text(hjust = 1, size = 14),  # Rotate x axis labels and increase size
+    axis.title.y = element_text(margin = margin(r = 20), size = 16),  # Increase space between y-axis and label
+    axis.title.x = element_text(margin = margin(t = 20), size = 16),  # Increase space between y-axis and label
+      strip.text = element_text(size = 16)) +
+  scale_y_continuous(labels = comma_format()) +  # Format y-axis with commas
+  guides(fill = "none") 
+```
+
+
+
+##stacked proportional plots for all watersheds
+```{r}
+#exclude total salt category, we want to only use the categories that make up total salt for the median value
+plot_data_w_all <- long_all_watersheds_df_uncertainty %>%
+  filter(Land_Use_Category != "Total Salt") %>%  # Exclude Total Salt category
+  group_by(Watershed, Land_Use_Category) %>%
+  summarize(Median = median(Salt_Applied), .groups = "drop") %>%
+  group_by(Watershed) %>%
+  mutate(Proportion = Median / sum(Median))
+
+
+plot_data_w_all<- plot_data_w_all %>%
+  mutate(Pattern = ifelse(Land_Use_Category %in% c("Road - Arterial/Collector", "Road - Local"), "Road", "Parking"))
+
+#plot the proportional plot
+plot_data_w_all %>% 
+  ggplot(aes(x = factor(Watershed, levels = 1:12), y = Proportion, fill = Land_Use_Category, pattern = Pattern)) +
+  geom_bar_pattern(stat = "identity",
+                   pattern_density = 0.3,
+                   pattern_spacing = 0.05,
+                   pattern_fill = "white",
+                   pattern_color = "black") +
+  scale_y_continuous(labels = scales::percent_format()) +  # Convert to percentage scale
+  labs(x = "Watershed", y = "Percentage of total salt loading", fill = "Land-use class", pattern = "Pattern") +
+  theme_bw() +
+  scale_fill_manual(values = custom_colors) +
+  theme(aspect.ratio = 1) + 
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = .5, size = 16, color = "black"),  #Rotate x axis labels and increase size
+    axis.text.y = element_text(hjust = 1, size = 16, color = "black"),  #Rotate x axis labels and increase size
+    axis.title.y = element_text(margin = margin(r = 10), size = 18),  #Increase space between y-axis and label
+    axis.title.x = element_text(margin = margin(t = 10), size = 18), #Increase space between y-axis and label
+    legend.text = element_text(size = 16),  #Increase legend text size
+    legend.title = element_text(size = 16)) +  # ncrease legend title size
+  scale_pattern_manual(values = c("Parking" = "none", "Road" = "circle")) +  #Define pattern types
+  guides(
+    fill = guide_legend(
+      override.aes = list(
+        pattern = "none",  #Remove patterns from fill legend
+        shape = 15,        #Use squares for the legend key (box-like appearance)
+        size = 4,          #Increase size of the squares
+        color = "black",   #Set the border color to black
+        linetype = "solid" #Ensure solid line for the box border
+      )
+    ),
+    pattern = guide_legend(
+      override.aes = list(
+        pattern = c("none", "circle"),  #Remove patterns for the legend
+        shape = 16,        #Use circles for pattern in the legend
+        color = "black",   #Border color for pattern boxes
+        size = 4,          #Adjust size of the circle
+        linetype = "solid" #Ensure solid lines around the circle
+      )
+    )
+  )
+```
